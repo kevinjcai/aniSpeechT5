@@ -1,17 +1,5 @@
-import json 
-
-
-import librosa
 import numpy as np
-import tqdm
-import os
-import random
-
-
-import json
-import numpy as np
-import os
-from torch.utils.data import Dataset as TorchDataset, DataLoader
+from torch.utils.data import Dataset as TorchDataset
 import torch
 
 class AudioDataset(TorchDataset):
@@ -26,6 +14,7 @@ class AudioDataset(TorchDataset):
       self.data = [pair.replace('\n','') for pair in open('datasets/training.tsv', 'r').readlines()]
     elif self.mode == "val":
       self.data = [pair.replace('\n','') for pair in open('datasets/valid.tsv', 'r').readlines()]
+
 
   def __len__(self):
     return len(self.data)

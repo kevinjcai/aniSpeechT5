@@ -1,11 +1,10 @@
 from pytorch_lightning import LightningModule, Trainer
 from transformers import SpeechT5Processor, SpeechT5ForSpeechToSpeech
 
-import sys
 from datasets.load_datasets import AudioDataset
 
 import torch
-from torch.utils.data import Dataset as DataLoader
+from torch.utils.data import Dataset as TorchDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 
