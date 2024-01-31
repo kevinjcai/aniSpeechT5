@@ -145,3 +145,4 @@ scripts/*.json
 
 test_images/
 lightning_logs/
+**/version_*/*
