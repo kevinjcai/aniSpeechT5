@@ -171,6 +171,7 @@ class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
             encoder_attentions=outputs.encoder_attentions,
             l1_loss=l1_loss,
             bce_loss=bce_loss,
+            spectrogram_prenet=spectrogram_prenet,
         )
 
     @torch.no_grad()
@@ -232,12 +233,14 @@ class SpeechT5Module(LightningModule):
 
         output, features = output
         features = features["labels"]
-        # np.save("holder/features.npy", features.cpu().detach().numpy())
-        # np.save("holder/spectrogram.npy", output.spectrogram.cpu().detach().numpy())
-        # np.save("holder/waveform.npy", en_audio[0].cpu().detach().numpy())
-        # # np.save("holder/waveform_jp.npy", jp_audio[0].cpu().detach().numpy())
-        # np.save("holder/spec_to_wave.npy",self.hifi_gan(features).cpu().detach().numpy())
-        # np.save("holder/output_waveform.npy", self.hifi_gan(output.spectrogram).cpu().detach().numpy())
+        np.save("holder/features.npy", features.cpu().detach().numpy())
+        np.save("holder/spectrogram.npy", output.spectrogram.cpu().detach().numpy())
+        np.save("holder/waveform.npy", en_audio[0].cpu().detach().numpy())
+        np.save("holder/waveform_jp.npy", jp_audio[0].cpu().detach().numpy())
+        np.save("holder/spec_to_wave.npy",self.hifi_gan(features).cpu().detach().numpy())
+        np.save("holder/output_waveform.npy", self.hifi_gan(output.spectrogram).cpu().detach().numpy())
+        np.save("holder/spectrogram_prenet.npy", output.spectrogram_prenet.cpu().detach().numpy())
+        
         self.log(
             "train/loss",
             output.loss,
