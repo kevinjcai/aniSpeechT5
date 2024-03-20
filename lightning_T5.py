@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 from lightning.pytorch import LightningModule, Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.utilities.types import EVAL_DATALOADERS
 
 from transformers import SpeechT5Processor
 from transformers.models.speecht5.modeling_speecht5 import (
@@ -19,16 +20,19 @@ from transformers.models.speecht5.modeling_speecht5 import (
     _generate_speech,
 )
 
-from datasets.load_datasets import AudioDataset
-
 import torch
 from torch.utils.data import Dataset as TorchDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 
+import os
+
+import auraloss
+
+from anim_datasets.load_datasets import AudioDataset
 
 class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
-    def __init__(self, config: SpeechT5Config):
+    def __init__(self, config: SpeechT5Config, sample_rate: int = 16000):
         super().__init__(config)
         config.use_guided_attention_loss = False
 
@@ -38,6 +42,17 @@ class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
         self.speech_decoder_postnet = SpeechT5SpeechDecoderPostnet(config)
 
         self.criterion = SpeechT5SpectrogramLoss(config)
+
+        # self.loss_fn = auraloss.freq.MultiResolutionSTFTLoss(
+        #     fft_sizes=[1024, 2048, 8192],
+        #     hop_sizes=[256, 512, 2048],
+        #     win_lengths=[1024, 2048, 8192],
+        #     scale="mel",
+        #     n_bins=128,
+        #     sample_rate=sample_rate,
+        #     perceptual_weighting=True,
+        # )
+        self.loss_fn =  auraloss.freq.MultiResolutionSTFTLoss()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -145,15 +160,14 @@ class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
             
             loss, l1_loss, bce_loss = self.criterion(
                 attention_mask,
-                # labels,
                 spectrogram_prenet,
                 spectrogram,
-                # labels,
                 logits,
                 labels,
-                # spectrogram,
                 outputs.cross_attentions,
             )
+            # spectrogram
+            # loss = self.loss_fn(spectrogram.T, labels.T)
 
         if not return_dict:
             output = (spectrogram,) + outputs[1:]
@@ -172,6 +186,7 @@ class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
             l1_loss=l1_loss,
             bce_loss=bce_loss,
             spectrogram_prenet=spectrogram_prenet,
+            
         )
 
     @torch.no_grad()
@@ -203,8 +218,9 @@ class SpeechT5ForSpeechToSpeech(SpeechT5PreTrainedModel):
 class SpeechT5Module(LightningModule):
     def __init__(self):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters()        
         self.processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_vc")
+        self.processor.do_normalize = True
         self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
         self.hifi_gan = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").eval()
         for p in self.hifi_gan.parameters():
@@ -230,16 +246,17 @@ class SpeechT5Module(LightningModule):
     def training_step(self, batch, batch_idx):
         jp_audio, en_audio = batch
         output = self(jp_audio, en_audio)
+        self.last_train_output = output, jp_audio, en_audio
 
         output, features = output
         features = features["labels"]
-        np.save("holder/features.npy", features.cpu().detach().numpy())
-        np.save("holder/spectrogram.npy", output.spectrogram.cpu().detach().numpy())
-        np.save("holder/waveform.npy", en_audio[0].cpu().detach().numpy())
-        np.save("holder/waveform_jp.npy", jp_audio[0].cpu().detach().numpy())
-        np.save("holder/spec_to_wave.npy",self.hifi_gan(features).cpu().detach().numpy())
-        np.save("holder/output_waveform.npy", self.hifi_gan(output.spectrogram).cpu().detach().numpy())
-        np.save("holder/spectrogram_prenet.npy", output.spectrogram_prenet.cpu().detach().numpy())
+        # np.save("holder/features.npy", features.cpu().detach().numpy())
+        # np.save("holder/spectrogram.npy", output.spectrogram.cpu().detach().numpy())
+        # np.save("holder/waveform.npy", en_audio[0].cpu().detach().numpy())
+        # np.save("holder/waveform_jp.npy", jp_audio[0].cpu().detach().numpy())
+        # np.save("holder/spec_to_wave.npy",self.hifi_gan(features).cpu().detach().numpy())
+        # np.save("holder/output_waveform.npy", self.hifi_gan(output.spectrogram).cpu().detach().numpy())
+        # np.save("holder/spectrogram_prenet.npy", output.spectrogram_prenet.cpu().detach().numpy())
         
         self.log(
             "train/loss",
@@ -268,33 +285,59 @@ class SpeechT5Module(LightningModule):
             logger=True,
             batch_size=len(jp_audio),
         )
+
         
         
-        if self.global_step % 100 == 0:
-            if output.spectrogram is not None:
-                # spectrogram = output.spectrogram[0].unsqueeze(0)
-                waveform = self.hifi_gan(output.spectrogram)
+        if self.global_step % 1e7 == 0:
+            # Log the spectrograms
+            self.logger.experiment.add_image(
+                "train/spectrogram",
+                torch.exp(output.spectrogram[0]),
+                global_step=self.global_step,
+                dataformats="WH",
+            )
+
+            # Log the spectrogram prenet
+            self.logger.experiment.add_image(
+                "train/spectrogram_prenet",
+                torch.exp(output.spectrogram_prenet[0]),
+                global_step=self.global_step,
+                dataformats="WH",
+            )
+
+            # Load the output label spectrogram
+            self.logger.experiment.add_image(
+                "train/labels",
+                torch.exp(features[0]),
+                global_step=self.global_step,
+                dataformats="WH",
+            )
+
+
+            # if output.spectrogram is not None:
+            #     # spectrogram = output.spectrogram[0].unsqueeze(0)
+            #     waveform = self.hifi_gan(output.spectrogram)
                 
-                if waveform.shape[0] > 0:
-                    # Log generated waveform
-                    self.logger.experiment.add_audio(
-                        "train/generated_waveform",
-                        waveform[0],
-                        global_step=self.global_step,
-                        sample_rate=16000,
-                    )
+            #     if waveform.shape[0] > 0:
+            #         # Log generated waveform
+            #         self.logger.experiment.add_audio(
+            #             "train/generated_waveform",
+            #             waveform[0],
+            #             global_step=self.global_step,
+            #             sample_rate=16000,
+            #         )
 
-                    # Assuming jp_audio or en_audio is the ground truth audio
-                    # Adjust this part as per your actual ground truth data structure
-                    ground_truth_audio = en_audio[0]
+            #         # Assuming jp_audio or en_audio is the ground truth audio
+            #         # Adjust this part as per your actual ground truth data structure
+            #         ground_truth_audio = en_audio[0]
 
-                    # Log ground truth audio
-                    self.logger.experiment.add_audio(
-                        "train/ground_truth_audio",
-                        ground_truth_audio,
-                        global_step=self.global_step,
-                        sample_rate=16000,  # Adjust this sample rate if necessary
-                    )
+            #         # Log ground truth audio
+            #         self.logger.experiment.add_audio(
+            #             "train/ground_truth_audio",
+            #             ground_truth_audio,
+            #             global_step=self.global_step,
+            #             sample_rate=16000,  # Adjust this sample rate if necessary
+            #         )
 
 
         return output.loss
@@ -303,7 +346,11 @@ class SpeechT5Module(LightningModule):
         jp_audio, en_audio = batch
 
         output = self(jp_audio, en_audio)
+        
+        self.last_val_output = output, jp_audio, en_audio
+
         output, features = output
+        features = features["labels"]
 
         self.log(
             "val/loss",
@@ -313,29 +360,110 @@ class SpeechT5Module(LightningModule):
             prog_bar=True,
             logger=True,
             batch_size=len(jp_audio),
+            sync_dist=True
+        )
+        self.log(
+            "val/l1_loss",
+            output.l1_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=len(jp_audio),
+            sync_dist=True
+        )
+        self.log(
+            "val/bce_loss",
+            output.bce_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=len(jp_audio),
+            sync_dist=True
         )
 
-        if output.spectrogram is not None and self.global_step % 1000 == 0:
-            spectrogram =  output.spectrogram[0].unsqueeze(0)
-            waveform = self.hifi_gan(spectrogram)
+        
+        
+        # if self.global_step % 1e7 == 0:
+        #     # Log the spectrograms
+        #     self.logger.experiment.add_image(
+        #         "val/spectrogram",
+        #         torch.exp(output.spectrogram[0]),
+        #         global_step=self.global_step,
+        #         dataformats="WH",
+        #     )
 
-            if waveform.shape[0] > 0:
-                self.logger.experiment.add_audio(
-                    "val/waveform",
-                    waveform[0],
-                    global_step=self.global_step,
-                    sample_rate=16000,
-                )
+        #     # Log the spectrogram prenet
+        #     self.logger.experiment.add_image(
+        #         "val/spectrogram_prenet",
+        #         torch.exp(output.spectrogram_prenet[0]),
+        #         global_step=self.global_step,
+        #         dataformats="WH",
+        #     )
+
+        #     # Load the output label spectrogram
+        #     self.logger.experiment.add_image(
+        #         "val/labels",
+        #         torch.exp(features[0]),
+        #         global_step=self.global_step,
+        #         dataformats="WH",
+        #     )
+
+
+            # if output.spectrogram is not None:
+            #     # spectrogram = output.spectrogram[0].unsqueeze(0)
+            #     waveform = self.hifi_gan(output.spectrogram)
+                
+            #     if waveform.shape[0] > 0:
+            #         # Log generated waveform
+            #         self.logger.experiment.add_audio(
+            #             "val/generated_waveform",
+            #             waveform[0],
+            #             global_step=self.global_step,
+            #             sample_rate=16000,
+            #         )
+
+            #         # Assuming jp_audio or en_audio is the ground truth audio
+            #         # Adjust this part as per your actual ground truth data structure
+            #         ground_truth_audio = en_audio[0]
+
+            #         # Log ground truth audio
+            #         self.logger.experiment.add_audio(
+            #             "val/ground_truth_audio",
+            #             ground_truth_audio,
+            #             global_step=self.global_step,
+            #             sample_rate=16000,  # Adjust this sample rate if necessary
+            #         )
+
 
         return output.loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
-        scheduler = {
-            'scheduler': torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=1),
-            'interval': 'epoch'
-        }
-        return [optimizer], [scheduler]
+
+        # Define the number of warm-up steps
+        warmup_steps = 4000
+        # Maximum learning rate after warm-up
+        max_lr = 5e-5
+        gamma = .99999
+        # Assume `total_steps` is accessible and tracks the global step count across epochs
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=max_lr)
+
+        
+        # Lambda function to adjust the learning rate based on global steps
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            # Apply your desired schedule post warm-up here
+            # Example: Continue with max_lr without decay
+            else:
+                return gamma ** (current_step - warmup_steps)
+
+        # Update the scheduler to use the step-based lambda function
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda current_step: lr_lambda(current_step))
+
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
         # return [optimizer]
 
     def custom_collate_fn(self, batch):
@@ -348,7 +476,7 @@ class SpeechT5Module(LightningModule):
         train_data = AudioDataset(mode="train")
         return DataLoader(
             train_data,
-            batch_size=1,
+            batch_size=20,
             shuffle=True,
             collate_fn=self.custom_collate_fn,
             num_workers=18,
@@ -358,37 +486,114 @@ class SpeechT5Module(LightningModule):
         val_data = AudioDataset(mode="val")
         return DataLoader(
             val_data,
-            batch_size=16,
+            batch_size=8,
             shuffle=False,
             collate_fn=self.custom_collate_fn,
             num_workers=4,
         )
+        
+    def test_dataloader(self):
+        test_data = AudioDataset(mode="test")
+        return DataLoader(
+            test_data,
+            batch_size=8,
+            shuffle=False,
+            collate_fn=self.custom_collate_fn,
+            num_workers=4,
+        )
+    
+    def log_audio_and_spectrogram(self, spectrogram, waveform, ground_truth_audio, labels, phase):
+        # Helper function to log audio and spectrogram
+        if spectrogram is not None and waveform.shape[0] > 0:
+            # Log generated waveform
+            self.logger.experiment.add_audio(
+                f"{phase}/generated_waveform",
+                waveform[0],
+                global_step=self.current_epoch,
+                sample_rate=16000,
+            )
 
-    # def on_epoch_end(self):
-    #     # Log learning rate at the end of each epoch
-    #     for idx, scheduler in enumerate(self.lr_schedulers()):
-    #         lr = scheduler.get_last_lr()[0]
-    #         self.log('lr', lr, on_epoch=True, logger=True)
+            # Log ground truth audio
+            self.logger.experiment.add_audio(
+                f"{phase}/ground_truth_audio",
+                ground_truth_audio,
+                global_step=self.current_epoch,
+                sample_rate=16000,
+            )
+
+            # Log spectrogram as an image, assuming spectrogram is a tensor you wish to visualize
+            # Adjust tensor operations as needed for your visualization purposes
+            spectrogram_image = torch.exp(spectrogram[0])  # Example transformation, adjust as needed
+            self.logger.experiment.add_image(
+                f"{phase}/spectrogram",
+                spectrogram_image,
+                self.current_epoch,
+                dataformats="WH",
+            )
+
+            # Log the output label spectrogram
+            self.logger.experiment.add_image(
+                f"{phase}/labels",
+                torch.exp(labels[0]),
+                self.current_epoch,
+                dataformats="WH",
+            )
+
+    def on_train_epoch_end(self, unused=None):
+        # Assuming you have stored the last training batch's output in self.last_train_output
+        if hasattr(self, 'last_train_output'):
+            
+            output, jp_audio, en_audio = self.last_train_output
+            output, feat = output
+            features = feat["labels"]
+            spectrogram = output.spectrogram if 'spectrogram' in output else None
+            waveform = self.hifi_gan(spectrogram) if spectrogram is not None else None
+            ground_truth_audio = en_audio[0]  # Adjust this part as per your actual data structure
+
+            self.log_audio_and_spectrogram(spectrogram, waveform, ground_truth_audio, features, "train")
+
+    def on_validation_epoch_end(self, unused=None):
+        # Assuming you have stored the last validation batch's output in self.last_val_output
+        if hasattr(self, 'last_val_output'):
+            output, jp_audio, en_audio = self.last_val_output
+            output, feat = output
+            features = feat["labels"]
+            spectrogram = output.spectrogram if 'spectrogram' in output else None
+            waveform = self.hifi_gan(spectrogram) if spectrogram is not None else None
+            ground_truth_audio = en_audio[0]  # Adjust this part as per your actual data structure
+
+            self.log_audio_and_spectrogram(spectrogram, waveform, ground_truth_audio, features, "val")
+        
+
+if __name__ == "__main__":
+    speech_t5_module = SpeechT5Module()
+
+    name = "logs/warmup_scheduler"
+    ver = 0
+    dir = f"/data/kevincai/ckpt/{name}/version_{ver}"
+    while os.path.exists(dir):
+        ver += 1
+        dir = f"/data/kevincai/ckpt/{name}/version_{ver}"
 
 
-speech_t5_module = SpeechT5Module()
+    logger = TensorBoardLogger(name, name="")
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=f"/data/kevincai/ckpt/{name}/version_{ver}",
+        monitor='val/loss',
+        filename='sample-{epoch:02d}-{val_loss:.2f}',
+        every_n_epochs=1,
+        save_last=True,
+    )
 
-logger = TensorBoardLogger("hifigan_logs", name="l1_loss_1e-4")
-# checkpoint_callback = ModelCheckpoint(
-#      monitor='val_loss',
-#      dirpath='my/path/',
-#      filename='sample-mnist-{epoch:02d}-{val_loss:.2f}'
-# )
+    trainer = Trainer(
+        max_epochs=15000,
+        accelerator="gpu",
+        strategy="ddp_find_unused_parameters_true",
+        logger=logger,
+        accumulate_grad_batches=30,
+        callbacks=[LearningRateMonitor(logging_interval='step'), checkpoint_callback],
+        # check_val_every_n_epoch=1,
+        enable_checkpointing=True,
+    )
 
-trainer = Trainer(
-    max_epochs=1000,
-    accelerator="gpu",
-    strategy="ddp_find_unused_parameters_true",
-    logger=logger,
-    # accumulate_grad_batches=5,
-    callbacks=[LearningRateMonitor(logging_interval='step')],
-    overfit_batches=1,
-    check_val_every_n_epoch=int(1e6),
-)
-
-trainer.fit(speech_t5_module)
+    trainer.fit(speech_t5_module)
